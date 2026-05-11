@@ -11,5 +11,5 @@ WORKDIR /app
 COPY --from=build /output .
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
-ENTRYPOINT ["docker-entrypoint.sh"]
+ENTRYPOINT ["./docker-entrypoint.sh"]
 CMD ["dotnet","Castor.dll"]
