@@ -58,6 +58,21 @@ docker run -v ./appsettings.json:/app/appsettings.json castor
 
 CI builds and pushes on push/PR to `main` (`.github/workflows/docker-image.yaml`).
 
+## Docker compose
+
+```
+  castor:
+    image: zlzforever/castor:20260511.5
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./castor_conf/appsettings.json:/app/appsettings.json:ro
+    deploy:
+      labels:
+        group: 'infra'
+```
+
 ## Logging
 
 Serilog with console + file + OpenTelemetry sinks. Configured in `appsettings.json` under `Serilog` section.
