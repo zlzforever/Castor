@@ -1,0 +1,26 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Castor", "src\Castor\Castor.csproj", "{0E428DB1-63D7-461E-AC11-74A4E7C2C569}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{4BCF8CC9-2782-4881-82EF-492FAD5AF445}"
+	ProjectSection(SolutionItems) = preProject
+		readme.md = readme.md
+		.gitignore = .gitignore
+		Dockerfile = Dockerfile
+		docker-entrypoint.sh = docker-entrypoint.sh
+		docker-image.yaml = .github/workflows/docker-image.yaml
+		AGENTS.md = AGENTS.md
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{0E428DB1-63D7-461E-AC11-74A4E7C2C569}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{0E428DB1-63D7-461E-AC11-74A4E7C2C569}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{0E428DB1-63D7-461E-AC11-74A4E7C2C569}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{0E428DB1-63D7-461E-AC11-74A4E7C2C569}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
