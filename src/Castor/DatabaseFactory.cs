@@ -3,6 +3,11 @@ using Microsoft.Extensions.Options;
 
 namespace Castor;
 
+/// <summary>
+/// 为多种数据库做准备
+/// </summary>
+/// <param name="options"></param>
+/// <param name="serviceProvider"></param>
 public class DatabaseFactory(IOptions<DatabaseOptions> options, IServiceProvider serviceProvider)
 {
     public IRepository Create()

@@ -1,3 +1,5 @@
+using System.Data.Common;
+using System.Text.RegularExpressions;
 using Dapper;
 using Npgsql;
 using Microsoft.Extensions.Options;
@@ -15,6 +17,9 @@ public class PostgreSQLRepository : IRepository
     private readonly string _upsertSql;
     private readonly string _deleteBatchSql;
     private readonly string _queryLastRevisionSql;
+    private readonly string _createTempSyncKeysSql;
+    private readonly string _insertTempSyncKeySql;
+    private readonly string _deleteStaleKeysSql;
 
     public PostgreSQLRepository(IOptions<DatabaseOptions> options, ILogger<PostgreSQLRepository> logger)
     {
@@ -76,10 +81,24 @@ public class PostgreSQLRepository : IRepository
         _queryLastRevisionSql = $$"""
                                   SELECT last_revision FROM {{tablePrefix}}etcd_sync_state WHERE id = 1;
                                   """;
+
+        _createTempSyncKeysSql = """CREATE TEMP TABLE IF NOT EXISTS _sync_keys (key VARCHAR(1024) PRIMARY KEY);""";
+
+        _insertTempSyncKeySql = """
+                                    INSERT INTO _sync_keys (key)
+                                    SELECT unnest(@Keys)
+                                    ON CONFLICT DO NOTHING;
+                                """;
+
+        _deleteStaleKeysSql = $$"""
+                                    DELETE FROM {{tablePrefix}}etcd_kv AS main
+                                    WHERE NOT EXISTS (
+                                        SELECT 1 FROM _sync_keys t WHERE t.key = main.key
+                                    );
+                                """;
     }
 
-
-    public string ConnectionString => _options.ConnectionString!;
+    public string HostLabel => ExtractHost(_options.ConnectionString);
 
     public async Task InitializeAsync(CancellationToken ct = default)
     {
@@ -113,58 +132,100 @@ public class PostgreSQLRepository : IRepository
         return revision.HasValue ? revision.Value <= 0 ? 0 : revision.Value : 0L;
     }
 
-    public void UpsertBatch(List<EtcdKvRecord> records, long lastRevision)
+    public async Task UpsertBatchAsync(List<EtcdKvRecord> records, long lastRevision,
+        CancellationToken stoppingToken = default)
     {
         if (records.Count == 0) return;
 
-        using var conn = CreateConnection();
+        await using var conn = CreateConnection();
         if (conn.State != System.Data.ConnectionState.Open)
         {
-            conn.Open();
+            await conn.OpenAsync(stoppingToken);
         }
 
-        using var tx = conn.BeginTransaction();
-        conn.Execute(_upsertSql, records, transaction: tx);
-        conn.Execute(_updateSyncStateSql, new { LastRevision = lastRevision }, transaction: tx);
-        tx.Commit();
+        await using var tx = await conn.BeginTransactionAsync(stoppingToken);
+        await conn.ExecuteAsync(_upsertSql, records, transaction: tx);
+        await conn.ExecuteAsync(_updateSyncStateSql, new { LastRevision = lastRevision }, transaction: tx);
+        await tx.CommitAsync(stoppingToken);
 
         _logger.LogDebug("Batch upserted {Count} keys", records.Count);
     }
 
-    public void SyncBatch(List<EtcdKvRecord> puts, List<string> deletes, long lastRevision)
+    public async Task SyncBatchAsync(List<EtcdKvRecord> puts, List<string> deletes, long lastRevision,
+        CancellationToken stoppingToken = default)
     {
         if (puts.Count == 0 && deletes.Count == 0)
         {
             return;
         }
 
-        using var conn = CreateConnection();
+        await using var conn = CreateConnection();
         if (conn.State != System.Data.ConnectionState.Open)
         {
-            conn.Open();
+            await conn.OpenAsync(stoppingToken);
         }
 
-        using var tx = conn.BeginTransaction();
+        await using var tx = await conn.BeginTransactionAsync(stoppingToken);
 
         if (puts.Count > 0)
         {
-            conn.Execute(_upsertSql, puts, transaction: tx);
+            await conn.ExecuteAsync(_upsertSql, puts, transaction: tx);
         }
 
         if (deletes.Count > 0)
         {
-            conn.Execute(_deleteBatchSql, new { Keys = deletes }, transaction: tx);
+            await conn.ExecuteAsync(_deleteBatchSql, new { Keys = deletes }, transaction: tx);
         }
 
-        conn.Execute(_updateSyncStateSql, new { LastRevision = lastRevision }, transaction: tx);
-        tx.Commit();
+        await conn.ExecuteAsync(_updateSyncStateSql, new { LastRevision = lastRevision }, transaction: tx);
+        await tx.CommitAsync(stoppingToken);
 
         _logger.LogDebug("Applied watch events: {Puts} upserts, {Deletes} deletes, {Rev}", puts.Count, deletes.Count,
             lastRevision);
     }
 
-    private NpgsqlConnection CreateConnection()
+    public async Task BeginStaleKeyTrackingAsync(DbConnection conn, CancellationToken ct = default)
+    {
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = _createTempSyncKeysSql;
+        await cmd.ExecuteNonQueryAsync(ct);
+        _logger.LogDebug("Temp sync keys table created");
+    }
+
+    public async Task TrackSyncKeysAsync(DbConnection conn, string[] keys)
+    {
+        if (keys.Length == 0)
+        {
+            return;
+        }
+
+        await conn.ExecuteAsync(_insertTempSyncKeySql, new { Keys = keys });
+    }
+
+    public async Task EndStaleKeyTrackingAsync(DbConnection conn, CancellationToken ct = default)
+    {
+        var deleted = await conn.ExecuteAsync(_deleteStaleKeysSql);
+
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DROP TABLE IF EXISTS _sync_keys";
+        await cmd.ExecuteNonQueryAsync(ct);
+
+        _logger.LogInformation("Stale key cleanup complete: {Count} keys deleted", deleted);
+    }
+
+    public DbConnection CreateConnection()
     {
         return new NpgsqlConnection(_options.ConnectionString);
+    }
+
+    private static string ExtractHost(string? connectionString)
+    {
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            return string.Empty;
+        }
+
+        var m = Regex.Match(connectionString, "Host=([^;]+)", RegexOptions.IgnoreCase);
+        return m.Success ? m.Groups[1].Value : "unknown";
     }
 }

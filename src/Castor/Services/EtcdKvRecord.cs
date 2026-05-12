@@ -7,5 +7,4 @@ public class EtcdKvRecord
     public long Version { get; set; }
     public long CreateRevision { get; set; }
     public long ModRevision { get; set; }
-    public DateTime UpdatedAt { get; set; }
 }

@@ -9,7 +9,7 @@ RUN cd src/Castor && dotnet publish -o /output && \
 FROM mcr.microsoft.com/dotnet/runtime:10.0 AS final
 WORKDIR /app
 
-# 安装 PostgreSQL 依赖的 krb5 库（正确、无错版本）
+# 安装 PostgreSQL 依赖的 krb5 库，不安装运行时会报错
 RUN apt-get update && apt-get install -y --no-install-recommends \
     krb5-user libgssapi-krb5-2 \
     && rm -rf /var/lib/apt/lists/*

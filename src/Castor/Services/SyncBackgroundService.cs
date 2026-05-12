@@ -1,4 +1,5 @@
-using System.Text.RegularExpressions;
+using System.Data;
+using System.Threading.Channels;
 using dotnet_etcd;
 using Etcdserverpb;
 using Google.Protobuf;
@@ -26,17 +27,25 @@ public class SyncBackgroundService(
         ? RangeEndAll
         : GetPrefixRangeEnd(etcd.Value.Prefix);
 
+    private readonly Channel<WatchResponse> _responseChannel =
+        Channel.CreateBounded<WatchResponse>(new BoundedChannelOptions(10000));
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        if (string.IsNullOrWhiteSpace(_etcdOptions.Url))
+        {
+            throw new InvalidOperationException("Etcd url is not configured");
+        }
+
         var repository = databaseFactory.Create();
         logger.LogInformation("Starting sync — etcd={Url}, prefix={Prefix}, pg={Host}", _etcdOptions.Url,
-            _etcdOptions.Prefix, ExtractHost(repository.ConnectionString));
+            _etcdOptions.Prefix, repository.HostLabel);
         await repository.InitializeAsync(stoppingToken);
 
         var lastRev = await repository.GetLastRevisionAsync(stoppingToken);
         logger.LogInformation("Last synced revision: {Rev}", lastRev);
 
-        var etcdClient = !string.IsNullOrEmpty(_etcdOptions.Username)
+        using var etcdClient = !string.IsNullOrEmpty(_etcdOptions.Username)
             ? new EtcdClient(_etcdOptions.Url, _etcdOptions.Username, _etcdOptions.Password)
             : new EtcdClient(_etcdOptions.Url);
 
@@ -48,11 +57,138 @@ public class SyncBackgroundService(
             logger.LogInformation("Initial full sync complete, revision {Rev}", lastRev);
         }
 
-        await WatchLoopAsync(etcdClient, repository, lastRev, stoppingToken);
+        var lastCheckpointRev = await WatchLoopAsync(etcdClient, repository, lastRev, stoppingToken);
+
+        var processed = 0L;
+
+        await foreach (var response in _responseChannel.Reader.ReadAllAsync(stoppingToken))
+        {
+            try
+            {
+                if (response.Events.Count == 0)
+                {
+                    continue;
+                }
+
+                var batch = new List<EtcdKvRecord>();
+                var deletes = new List<string>();
+                var maxEventRev = lastCheckpointRev;
+
+                foreach (var e in response.Events)
+                {
+                    if (e?.Kv == null)
+                    {
+                        continue;
+                    }
+
+                    var eventKey = e.Kv.Key.ToStringUtf8();
+                    if (eventKey == null)
+                    {
+                        continue;
+                    }
+
+                    if (e.Type == Mvccpb.Event.Types.EventType.Put)
+                    {
+                        batch.Add(new EtcdKvRecord
+                        {
+                            Key = eventKey,
+                            Value = e.Kv.Value.ToStringUtf8(),
+                            Version = e.Kv.Version,
+                            CreateRevision = e.Kv.CreateRevision,
+                            ModRevision = e.Kv.ModRevision
+                        });
+                    }
+                    else if (e.Type == Mvccpb.Event.Types.EventType.Delete)
+                    {
+                        deletes.Add(eventKey);
+                    }
+
+                    if (e.Kv?.ModRevision > maxEventRev)
+                    {
+                        maxEventRev = e.Kv.ModRevision;
+                    }
+                }
+
+                if (maxEventRev > lastCheckpointRev)
+                {
+                    lastCheckpointRev = maxEventRev;
+                }
+
+                await repository.SyncBatchAsync(batch, deletes, lastCheckpointRev, stoppingToken);
+                processed = Interlocked.Add(ref processed, response.Events.Count);
+
+                logger.LogInformation(
+                    "Applied {Puts} puts + {Deletes} deletes @ rev {Rev}, total processed {Total}",
+                    batch.Count, deletes.Count, lastCheckpointRev, processed);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Handle response failed {Message}", ex.Message);
+            }
+        }
+    }
+
+    private async Task<long> WatchLoopAsync(EtcdClient etcdClient, IRepository repository, long startRev,
+        CancellationToken stoppingToken)
+    {
+        var lastCheckpointRev = startRev;
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                var request = new WatchRequest
+                {
+                    CreateRequest = new WatchCreateRequest
+                    {
+                        Key = _rangeStart,
+                        RangeEnd = _rangeEnd,
+                        StartRevision = lastCheckpointRev,
+                        ProgressNotify = false
+                    }
+                };
+
+                await etcdClient.WatchAsync(request, (Action<WatchResponse>)(response =>
+                {
+                    while (!_responseChannel.Writer.TryWrite(response))
+                    {
+                        Task.Delay(10, stoppingToken)
+                            .ConfigureAwait(false) // 关键：不捕获原有上下文
+                            .GetAwaiter()
+                            .GetResult();
+                    }
+                }), cancellationToken: stoppingToken);
+
+                logger.LogInformation("Watch established from revision {Rev}", lastCheckpointRev);
+                break;
+            }
+            catch (RpcException ex) when (IsCompactedError(ex))
+            {
+                logger.LogWarning("Revision {Rev} compacted by etcd, falling back to full sync", lastCheckpointRev);
+                lastCheckpointRev = await FullSyncAsync(etcdClient, repository, stoppingToken);
+                logger.LogInformation("Re-sync complete, restored to revision {Rev}", lastCheckpointRev);
+                await Task.Delay(150, stoppingToken);
+            }
+            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+            {
+                logger.LogError(ex, "Watch loop failed, will try again after 5 seconds");
+                await Task.Delay(5000, stoppingToken);
+            }
+        }
+
+        return lastCheckpointRev;
     }
 
     private async Task<long> FullSyncAsync(EtcdClient client, IRepository repository, CancellationToken ct)
     {
+        await using var conn = repository.CreateConnection();
+        if (conn.State != ConnectionState.Open)
+        {
+            await conn.OpenAsync(ct);
+        }
+
+        await repository.BeginStaleKeyTrackingAsync(conn, ct);
+
         var count = 0;
         var key = _rangeStart;
         var latestRev = 0L;
@@ -88,7 +224,8 @@ public class SyncBackgroundService(
                 });
             }
 
-            repository.UpsertBatch(batch, latestRev);
+            await repository.UpsertBatchAsync(batch, latestRev, ct);
+            await repository.TrackSyncKeysAsync(conn, batch.Select(kv => kv.Key).ToArray());
             count += batch.Count;
 
             var lastKey = response.Kvs[^1].Key;
@@ -99,115 +236,9 @@ public class SyncBackgroundService(
             await Task.Delay(50, ct);
         }
 
+        await repository.EndStaleKeyTrackingAsync(conn, ct);
         logger.LogInformation("Full sync complete: {Count} keys, rev {Rev}", count, latestRev);
         return latestRev;
-    }
-
-    private async Task WatchLoopAsync(EtcdClient etcdClient, IRepository repository, long startRev,
-        CancellationToken stoppingToken)
-    {
-        var lastCheckpointRev = startRev;
-        var processed = 0L;
-
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            try
-            {
-                var request = new WatchRequest
-                {
-                    CreateRequest = new WatchCreateRequest
-                    {
-                        Key = _rangeStart,
-                        RangeEnd = _rangeEnd,
-                        StartRevision = lastCheckpointRev,
-                        ProgressNotify = false
-                    }
-                };
-
-                void WatchResponseHandler(WatchResponse response)
-                {
-                    try
-                    {
-                        if (response.Events.Count == 0)
-                        {
-                            return;
-                        }
-
-                        var batch = new List<EtcdKvRecord>();
-                        var deletes = new List<string>();
-                        var maxEventRev = lastCheckpointRev;
-
-                        foreach (var e in response.Events)
-                        {
-                            if (e?.Kv == null)
-                            {
-                                continue;
-                            }
-
-                            var eventKey = e.Kv.Key.ToStringUtf8();
-                            if (eventKey == null)
-                            {
-                                continue;
-                            }
-
-                            if (e.Type == Mvccpb.Event.Types.EventType.Put)
-                            {
-                                batch.Add(new EtcdKvRecord
-                                {
-                                    Key = eventKey,
-                                    Value = e.Kv.Value.ToStringUtf8(),
-                                    Version = e.Kv.Version,
-                                    CreateRevision = e.Kv.CreateRevision,
-                                    ModRevision = e.Kv.ModRevision
-                                });
-                            }
-                            else if (e.Type == Mvccpb.Event.Types.EventType.Delete)
-                            {
-                                deletes.Add(eventKey);
-                            }
-
-                            if (e.Kv?.ModRevision > maxEventRev)
-                            {
-                                maxEventRev = e.Kv.ModRevision;
-                            }
-                        }
-
-                        if (maxEventRev > lastCheckpointRev)
-                        {
-                            lastCheckpointRev = maxEventRev;
-                        }
-
-                        repository.SyncBatch(batch, deletes, lastCheckpointRev);
-                        processed = Interlocked.Add(ref processed, response.Events.Count);
-
-                        logger.LogInformation("Applied {Puts} puts + {Deletes} deletes @ rev {Rev}, total processed {Total}",
-                            batch.Count, deletes.Count, lastCheckpointRev, processed);
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogError(ex, "Watch event handler failed");
-                    }
-                }
-
-                await etcdClient.WatchAsync(request, WatchResponseHandler, cancellationToken: stoppingToken);
-                logger.LogInformation("Watch established from revision {Rev}", lastCheckpointRev);
-
-                // 一直等待到程序取消！！！
-                await Task.Delay(Timeout.Infinite, stoppingToken);
-            }
-            catch (RpcException ex) when (IsCompactedError(ex))
-            {
-                logger.LogWarning("Revision {Rev} compacted by etcd, falling back to full sync", lastCheckpointRev);
-                lastCheckpointRev = await FullSyncAsync(etcdClient, repository, stoppingToken);
-                logger.LogInformation("Re-sync complete, restored to revision {Rev}", lastCheckpointRev);
-                await Task.Delay(150, stoppingToken);
-            }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
-            {
-                logger.LogError(ex, "Watch loop failed, will try again after 5 seconds");
-                await Task.Delay(5000, stoppingToken);
-            }
-        }
     }
 
     private static bool IsCompactedError(RpcException ex)
@@ -233,11 +264,5 @@ public class SyncBackgroundService(
         }
 
         return ByteString.CopyFrom(0); // all bytes 0xff: fallback to all keys
-    }
-
-    private static string ExtractHost(string connectionString)
-    {
-        var m = Regex.Match(connectionString, "Host=([^;]+)", RegexOptions.IgnoreCase);
-        return m.Success ? m.Groups[1].Value : "unknown";
     }
 }

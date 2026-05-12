@@ -3,8 +3,15 @@ name: Docker Image CI
 on:
   push:
     branches: [ "main" ]
+    tags: [ 'v*' ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Custom Docker image tag (defaults to git tag or commit SHA)'
+        required: false
+        type: string
 
 jobs:
 
@@ -13,10 +20,26 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+    - uses: actions/checkout@v3
+
     - name: Login docker registry
       run: docker login -u ${{ secrets.DOCKER_USER }} -p  ${{ secrets.DOCKER_PASSWORD }}
-    - uses: actions/checkout@v3
+
+    - name: Determine image tag
+      id: meta
+      run: |
+        if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+          TAG="${{ github.event.inputs.image_tag }}"
+        elif [ "${{ github.ref_type }}" = "tag" ]; then
+          TAG="${{ github.ref_name }}"
+        else
+          TAG="${{ github.sha }}"
+        fi
+        echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
     - name: Build the Docker image
-      run: docker build . --file Dockerfile --tag zlzforever/castor:20260511.5
+      run: docker build . --file Dockerfile --tag zlzforever/castor:${{ steps.meta.outputs.tag }}
+
     - name: Publish the Docker image
-      run: docker push zlzforever/castor:20260511.5
+      if: github.event_name != 'pull_request'
+      run: docker push zlzforever/castor:${{ steps.meta.outputs.tag }}
